@@ -8,6 +8,10 @@ Writes four files into an output folder (default data/inputs/drafts, git-ignored
   - worklist.md / worklist.csv: hinted bonds with a recent NSE price, for manual confirmation.
   - README.md: explains the workflow.
 
+Optional BondDekho hints (bonddekho_dir): read from LOCAL raw files <ISIN>.txt only, never fetched.
+They appear only as bd_*_unverified / bd_status / bd_*_vs_nse columns in master_review.csv and
+worklist.csv, and as a markdown column in worklist.md. They are never written to the DRAFT master.
+
 Nothing here is imported automatically, and nothing here feeds eligibility or the screener.
 Hint values are NOT verified master data. Pure rendering over the database; never fetches the
 CDSL or BondDekho links (they are strings for manual viewing only).
@@ -18,12 +22,14 @@ from __future__ import annotations
 import csv
 import io
 import sqlite3
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import dataclass, field
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Optional
 
 from india_bonds.data_sources.csv_import import MASTER_HEADER
+from india_bonds.enrichment.bonddekho import parse_bonddekho
 
 DRAFT_MASTER_NAME = "instrument_master_DRAFT.csv"
 MASTER_REVIEW_NAME = "master_review.csv"
@@ -41,17 +47,25 @@ WORKLIST_HEADER_TEXT = (
     "Coupon frequency, ratings, security and risk flags must come from you."
 )
 
+# BondDekho hint columns: appended after the existing columns. Every value is UNVERIFIED.
+# A *_vs_nse conflict means the NSE-name value was kept (it stays in face_hint / maturity_hint)
+# and a human must check it. BondDekho face values are never written to any column.
+BD_COLUMNS = [
+    "bd_status", "bd_rating_unverified", "bd_rating_agency_unverified", "bd_frequency_unverified",
+    "bd_secured_unverified", "bd_seniority_unverified", "bd_face_vs_nse", "bd_maturity_vs_nse",
+]
 REVIEW_HEADER = [
     "isin", "issuer", "series", "coupon_hint", "maturity_hint", "face_hint", "years_to_maturity",
     "perpetual_hint", "at1_hint", "call_hint", "hint_warnings", "latest_price_date",
     "latest_price_kind", "nse_reported_yield_pct", "trades", "still_missing",
-    "cdsl_reference_url", "bonddekho_reference_url",
+    "cdsl_reference_url", "bonddekho_reference_url", *BD_COLUMNS,
 ]
 WORKLIST_HEADER = [
     "isin", "issuer_series", "coupon_hint", "maturity_hint", "years_left", "face_hint",
     "nse_price_per_100", "nse_reported_yield_pct_unverified", "trades", "price_date",
-    "still_missing", "cdsl_reference_url", "bonddekho_reference_url",
+    "still_missing", "cdsl_reference_url", "bonddekho_reference_url", *BD_COLUMNS,
 ]
+_SECURED_WORD = {True: "secured", False: "unsecured"}
 
 _HINT_SQL = """
 SELECT h.isin, h.raw, h.issuer, h.series, h.coupon_pct AS coupon_hint,
@@ -82,6 +96,8 @@ class DraftSummary:
     master_rows: int
     review_rows: int
     worklist_rows: int
+    bd_status_counts: dict = field(default_factory=dict)
+    bd_conflict_rows: int = 0
 
 
 def _num_text(value: Optional[float]) -> str:
@@ -181,6 +197,59 @@ def master_draft_rows(hinted: list[dict]) -> list[dict]:
     return rows
 
 
+def _bd_blank() -> dict:
+    return {**{c: "" for c in BD_COLUMNS}, "_md": ""}
+
+
+def _vs_nse(bd_value, nse_value, same) -> str:
+    if bd_value is None or nse_value is None:
+        return ""
+    return "agree" if same(bd_value, nse_value) else "conflict"
+
+
+def _bd_md_text(cells: dict, conflicts: list[str]) -> str:
+    parts = [cells["bd_frequency_unverified"], cells["bd_secured_unverified"]]
+    rating, agency = cells["bd_rating_unverified"], cells["bd_rating_agency_unverified"]
+    if rating:
+        parts.append(f"{rating} ({agency})" if agency else rating)
+    parts.extend(f"CONFLICT: {name}" for name in conflicts)
+    return " · ".join(p for p in parts if p)
+
+
+def bonddekho_cells(isin: str, hint: dict, bd_dir: Optional[Path]) -> dict:
+    """BondDekho hint cells for one ISIN, read from <bd_dir>/<ISIN>.txt. Never touches the network.
+
+    bd_dir None disables BondDekho: every cell is blank. A missing file gives bd_status no_file;
+    a file without a parsed bond gives not_found. Frequency, security and rating are shown only
+    as unverified columns; the NSE values in hint stay authoritative.
+    """
+    if bd_dir is None:
+        return _bd_blank()
+    cells = _bd_blank()
+    path = Path(bd_dir) / f"{isin}.txt"
+    if not path.is_file():
+        cells["bd_status"], cells["_md"] = "no_file", "no file"
+        return cells
+    rec = parse_bonddekho(path.read_text(encoding="utf-8", errors="replace"))
+    if not rec.found:
+        cells["bd_status"], cells["_md"] = "not_found", "not found"
+        return cells
+    cells["bd_status"] = "found"
+    cells["bd_rating_unverified"] = rec.rating or ""
+    cells["bd_rating_agency_unverified"] = rec.rating_agency or ""
+    cells["bd_frequency_unverified"] = rec.coupon_frequency or ""
+    cells["bd_secured_unverified"] = _SECURED_WORD.get(rec.secured, "")
+    cells["bd_seniority_unverified"] = rec.seniority or ""
+    cells["bd_face_vs_nse"] = _vs_nse(rec.face_value, hint.get("face_hint"),
+                                      lambda a, b: abs(float(a) - float(b)) < 1e-9)
+    bd_maturity = rec.maturity_date.isoformat() if rec.maturity_date else None
+    cells["bd_maturity_vs_nse"] = _vs_nse(bd_maturity, hint.get("maturity_hint"), lambda a, b: a == b)
+    conflicts = [name for name, col in (("face", "bd_face_vs_nse"), ("maturity", "bd_maturity_vs_nse"))
+                 if cells[col] == "conflict"]
+    cells["_md"] = _bd_md_text(cells, conflicts)
+    return cells
+
+
 def _flag(value: Optional[int]) -> str:
     return "" if value is None else str(int(value))
 
@@ -207,6 +276,7 @@ def review_rows(hinted: list[dict]) -> list[dict]:
             "still_missing": "; ".join(h["still_missing"]),
             "cdsl_reference_url": h["cdsl_reference_url"],
             "bonddekho_reference_url": h["bonddekho_reference_url"],
+            **h.get("bd", _bd_blank()),
         })
     return rows
 
@@ -240,6 +310,7 @@ def worklist(hinted: list[dict], today: date, max_age_days: int) -> list[dict]:
             "_missing_list": h["still_missing"],
             "cdsl_reference_url": h["cdsl_reference_url"],
             "bonddekho_reference_url": h["bonddekho_reference_url"],
+            **h.get("bd", _bd_blank()),
         })
     return rows
 
@@ -287,17 +358,18 @@ def _worklist_md(rows: list[dict], as_of: date, max_age_days: int) -> str:
         "",
         "| ISIN | Issuer / series | Coupon hint % | Maturity hint | Years left | Face hint | "
         "NSE price per 100 | NSE traded yield % (unverified) | Trades | Price date | "
-        "Still missing | Reference links |",
-        "|---|---|---|---|---|---|---|---|---|---|---|---|",
+        "Still missing | BondDekho (unverified) | Reference links |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     if not rows:
-        lines.append("| _no rows_ |  |  |  |  |  |  |  |  |  |  |  |")
+        lines.append("| _no rows_ |  |  |  |  |  |  |  |  |  |  |  |  |")
     for r in rows:
         links = f"[CDSL]({r['cdsl_reference_url']}) · [BondDekho]({r['bonddekho_reference_url']})"
         cells = [
             r["isin"], r["issuer_series"], r["coupon_hint"], r["maturity_hint"], r["years_left"],
             r["face_hint"], r["nse_price_per_100"], r["nse_reported_yield_pct_unverified"],
-            r["trades"], r["price_date"], _still_missing_short(r["_missing_list"]), links,
+            r["trades"], r["price_date"], _still_missing_short(r["_missing_list"]),
+            r.get("_md", ""), links,
         ]
         lines.append("| " + " | ".join(_md_cell(c) for c in cells) + " |")
     return "\n".join(lines) + "\n"
@@ -330,6 +402,11 @@ type, or risk flags.
   NSE price snapshot, and `still_missing`, the list of fields you must supply.
 - `worklist.md` and `worklist.csv`: hinted bonds with an NSE price in the window, best reported yield
   first. The yield is NSE's own figure and is unverified.
+- The `bd_*_unverified` columns (and `bd_status`, `bd_face_vs_nse`, `bd_maturity_vs_nse`) in
+  `master_review.csv` and `worklist.csv` hold BondDekho aggregator hints. They are unverified and are
+  never written to `instrument_master_DRAFT.csv`. `bd_status` is found, not_found, or no_file.
+- A `CONFLICT` in `bd_face_vs_nse` or `bd_maturity_vs_nse` means BondDekho disagrees with the NSE-name
+  value. The NSE value was kept in `face_hint` or `maturity_hint`; check it by hand on the CDSL page.
 
 ## Workflow
 
@@ -348,8 +425,12 @@ Nothing here feeds eligibility or the screener, and nothing is imported automati
 
 
 def write_drafts(conn: sqlite3.Connection, out_dir, *, today: Optional[date] = None,
-                 max_age_days: int = 7) -> DraftSummary:
-    """Write the four draft files into out_dir (overwritten). Returns counts."""
+                 max_age_days: int = 7, bonddekho_dir=None) -> DraftSummary:
+    """Write the five draft files into out_dir (overwritten). Returns counts.
+
+    bonddekho_dir: folder of local BondDekho raw files (<ISIN>.txt). None (default) disables the
+    BondDekho columns. Files are read only; this function makes no network calls.
+    """
     if today is None:
         from india_bonds.refresh import ist_today
         today = ist_today()
@@ -357,6 +438,12 @@ def write_drafts(conn: sqlite3.Connection, out_dir, *, today: Optional[date] = N
     out.mkdir(parents=True, exist_ok=True)
 
     hinted = load_hinted(conn, today)
+    for h in hinted:
+        h["bd"] = bonddekho_cells(h["isin"], h, bonddekho_dir)
+    bd_status_counts = dict(Counter(h["bd"]["bd_status"] for h in hinted if h["bd"]["bd_status"]))
+    bd_conflict_rows = sum(
+        1 for h in hinted
+        if "conflict" in (h["bd"]["bd_face_vs_nse"], h["bd"]["bd_maturity_vs_nse"]))
     master = master_draft_rows(hinted)
     review = review_rows(hinted)
     work = worklist(hinted, today, max_age_days)
@@ -370,4 +457,5 @@ def write_drafts(conn: sqlite3.Connection, out_dir, *, today: Optional[date] = N
     return DraftSummary(
         out_dir=out, as_of=today, max_age_days=max_age_days, hinted=len(hinted),
         master_rows=len(master), review_rows=len(review), worklist_rows=len(work),
+        bd_status_counts=bd_status_counts, bd_conflict_rows=bd_conflict_rows,
     )

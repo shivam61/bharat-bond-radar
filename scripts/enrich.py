@@ -2,10 +2,12 @@
 
 Usage:
     .venv/bin/python scripts/enrich.py draft [--db data/bonds.db] [--out data/inputs/drafts]
-        [--max-age-days 7]
+        [--max-age-days 7] [--bonddekho-dir data/raw/bonddekho | --no-bonddekho]
 
 Writes instrument_master_DRAFT.csv, master_review.csv, worklist.md, worklist.csv and README.md
 into --out (overwritten on rerun). Nothing is imported into the database or the screener.
+BondDekho hints are read from local <ISIN>.txt files in --bonddekho-dir (no network). They fill
+only the unverified bd_* columns; instrument_master_DRAFT.csv never contains them.
 
 Exit codes: 0 ok, 2 database file not found, 1 unexpected error (traceback printed).
 """
@@ -25,6 +27,7 @@ from india_bonds.enrichment.drafts import write_drafts  # noqa: E402
 EXIT_OK = 0
 EXIT_UNEXPECTED = 1
 EXIT_DB = 2
+DEFAULT_BONDDEKHO_DIR = "data/raw/bonddekho"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -35,6 +38,10 @@ def main(argv: list[str] | None = None) -> int:
     draft.add_argument("--out", default="data/inputs/drafts", help="output folder (default data/inputs/drafts)")
     draft.add_argument("--max-age-days", type=int, default=7,
                        help="worklist: include bonds whose latest price is this many days old or newer")
+    draft.add_argument("--bonddekho-dir", default=DEFAULT_BONDDEKHO_DIR,
+                       help="local BondDekho raw files <ISIN>.txt (default data/raw/bonddekho); read only")
+    draft.add_argument("--no-bonddekho", action="store_true",
+                       help="leave the bd_* BondDekho columns blank")
     args = parser.parse_args(argv)
 
     if args.max_age_days < 0:
@@ -43,9 +50,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: database not found: {args.db}", file=sys.stderr)
         return EXIT_DB
 
+    bd_dir = None if args.no_bonddekho else args.bonddekho_dir
     conn = db.connect(args.db)
     try:
-        s = write_drafts(conn, args.out, max_age_days=args.max_age_days)
+        s = write_drafts(conn, args.out, max_age_days=args.max_age_days, bonddekho_dir=bd_dir)
     except Exception:  # noqa: BLE001 - show the traceback, exit 1
         traceback.print_exc()
         return EXIT_UNEXPECTED
@@ -57,6 +65,12 @@ def main(argv: list[str] | None = None) -> int:
     print(f"instrument_master_DRAFT.csv rows: {s.master_rows}")
     print(f"master_review.csv rows: {s.review_rows}")
     print(f"worklist rows (price within {s.max_age_days} day(s)): {s.worklist_rows}")
+    if bd_dir is None:
+        print("BondDekho hints: disabled (--no-bonddekho)")
+    else:
+        counts = " ".join(f"{k}={s.bd_status_counts.get(k, 0)}" for k in ("found", "not_found", "no_file"))
+        print(f"BondDekho hints from {bd_dir} (unverified): {counts}; rows with a face/maturity "
+              f"conflict: {s.bd_conflict_rows}")
     return EXIT_OK
 
 
