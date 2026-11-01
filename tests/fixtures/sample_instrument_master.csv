@@ -1,0 +1,4 @@
+isin,issuer_name,instrument_name,face_value,coupon_pct,coupon_frequency,first_interest_date,maturity_date,issue_date,security_type,seniority,collateral_text,is_perpetual,is_at1,is_structured,default_flag,trading_suspended,currency,source_url,retrieved_on
+INE000T00001,SYNTHETIC ISSUER ALPHA,SYNTHETIC ALPHA 9.00% 2028,1000,9.00,annual,2026-03-15,2028-03-15,2025-03-15,secured,senior,SYNTHETIC collateral,false,false,false,false,false,INR,SYNTHETIC TEST DATA,2026-10-31
+INE000T00002,SYNTHETIC ISSUER BETA,SYNTHETIC BETA 8.50% 2029,1000,,,,2029-06-30,,unsecured,subordinated,,,,,,,INR,SYNTHETIC TEST DATA,2026-10-31
+INE000T00003,SYNTHETIC ISSUER GAMMA,SYNTHETIC GAMMA ZERO 2027,100,0,zero,,2027-01-01,2025-01-01,unknown,unknown,,false,false,false,false,false,INR,SYNTHETIC TEST DATA,2026-10-31

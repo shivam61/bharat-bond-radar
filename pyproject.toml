@@ -1,0 +1,14 @@
+[project]
+name = "india-bonds"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = ["pandas", "streamlit", "plotly", "requests", "python-dateutil"]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.setuptools.packages.find]
+include = ["india_bonds*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

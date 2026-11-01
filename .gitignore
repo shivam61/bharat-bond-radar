@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+# local data: databases, raw downloads, logs, your CSV inputs
+data/
+.claude/

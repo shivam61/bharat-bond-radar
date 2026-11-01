@@ -1,0 +1,13 @@
+{
+  "counts": {
+    "primary": 0,
+    "rejected": 5353,
+    "speculative": 0,
+    "total": 5353
+  },
+  "date": "2026-11-02",
+  "latest_price_date": null,
+  "run_id": "screen-2026-11-02",
+  "schema_version": 1,
+  "settlement_from": "stored"
+}
