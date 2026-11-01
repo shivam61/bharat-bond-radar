@@ -132,3 +132,23 @@ CREATE TABLE IF NOT EXISTS screen_result (
     settlement        TEXT,   -- screening date used for this run (YYYY-MM-DD)
     vendor_ytm        REAL    -- vendor-quoted YTM, shown for comparison only; never used as our YTM
 );
+
+-- DRAFT, UNVERIFIED hints parsed from NSE descriptor names (instrument.name). Never master data:
+-- nothing in the screener reads this table. Written by refresh (descriptor hints step) only when
+-- the parsed values change; observed_at is when the current value was first seen.
+CREATE TABLE IF NOT EXISTS descriptor_hint (
+    isin           TEXT PRIMARY KEY REFERENCES instrument(isin),
+    raw            TEXT,
+    issuer         TEXT,
+    series         TEXT,
+    kind           TEXT,
+    coupon_pct     REAL,
+    maturity_date  TEXT,
+    face_value     REAL,
+    perpetual_hint INT,
+    at1_hint       INT,
+    call_hint      INT,
+    warnings       TEXT,                       -- '; '-joined parser warnings
+    source_id      INTEGER REFERENCES source_record(id),
+    observed_at    TEXT                        -- ISO-8601 UTC
+);

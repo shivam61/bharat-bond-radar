@@ -6,4 +6,4 @@ Newest settlement first. Each day links to its README.
 
 | Settlement date | Run ID | Primary | Speculative (A+/A) | Rejected |
 | --- | --- | --- | --- | --- |
-| [2026-11-02](2026-11-02/README.md) | `screen-2026-11-02` | 0 | 0 | 5353 |
+| [2026-11-02](2026-11-02/README.md) | `screen-2026-11-02` | 0 | 0 | 1764 |

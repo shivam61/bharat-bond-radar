@@ -1,0 +1,282 @@
+"""Draft worksheets from descriptor hints (enrichment/drafts.py, scripts/enrich.py). No network.
+
+SYNTHETIC ISINs and issuers; descriptor strings follow the NSE naming pattern only."""
+
+from __future__ import annotations
+
+import csv
+import sqlite3
+import subprocess
+import sys
+from datetime import date, timedelta
+from pathlib import Path
+
+from india_bonds.data_sources import csv_import as ci
+from india_bonds.database import db
+from india_bonds.enrichment.descriptor import parse_descriptor
+from india_bonds.enrichment.drafts import (
+    BONDDEKHO_URL,
+    CDSL_URL,
+    DRAFT_MASTER_NAME,
+    MASTER_REVIEW_NAME,
+    README_NAME,
+    WORKLIST_CSV_NAME,
+    WORKLIST_MD_NAME,
+    WORKLIST_HEADER_TEXT,
+    write_drafts,
+)
+from india_bonds.screening.screener import run_screen
+
+SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "enrich.py"
+TODAY = date(2026, 11, 2)
+OBSERVED = "2026-11-01T18:00:00+00:00"
+
+# Full hint, no master coupon -> in draft master.
+DRAFT_ISIN = "INE000B00001"
+DRAFT_NAME = "REC LIMITED SR 261 8.3 BD 31OT31 FVRS1LAC"
+# Full hint, perpetual hint, no master coupon -> in draft master with is_perpetual blank.
+PERP_ISIN = "INE000B00002"
+PERP_NAME = "ALPHA CAPITAL SR P1 9.5 NCD 31DC35 PERP FVRS1LAC"
+# Full hint but master already has a coupon -> not in draft master, still in review.
+HAS_COUPON_ISIN = "INE000B00003"
+HAS_COUPON_NAME = "GAMMA FIN SR 7 8.0 NCD 31OT30 FVRS1LAC"
+# Partial hint (no face value) -> review only.
+PARTIAL_ISIN = "INE000B00004"
+PARTIAL_NAME = "DELTA FIN SR 1 BD 31OT31"
+# Issuer-only -> no hint at all.
+ISSUER_ISIN = "INE000B00005"
+ISSUER_NAME = "EPSILON FINANCE LIMITED"
+# Priced hinted bonds for worklist ordering.
+PRICED_LOW_ISIN = "INE000B00006"     # yield 8.1, trades 3
+PRICED_TIE_ISIN = "INE000B00007"     # yield 9.0, trades 1
+PRICED_TIE_TOP_ISIN = "INE000B00008"  # yield 9.0, trades 5
+STALE_ISIN = "INE000B00009"          # priced 30 days ago -> outside 7-day window
+UNPRICED_ISIN = "INE000B00010"       # hint, no price at all
+
+NAMES = {
+    DRAFT_ISIN: DRAFT_NAME, PERP_ISIN: PERP_NAME, HAS_COUPON_ISIN: HAS_COUPON_NAME,
+    PARTIAL_ISIN: PARTIAL_NAME, ISSUER_ISIN: ISSUER_NAME,
+    PRICED_LOW_ISIN: "OMEGA CAPITAL SR A 8.1 NCD 31OT31 FVRS1LAC",
+    PRICED_TIE_ISIN: "OMEGA CAPITAL SR B 9.0 NCD 31OT31 FVRS1LAC",
+    PRICED_TIE_TOP_ISIN: "OMEGA CAPITAL SR C 9.0 NCD 31OT31 FVRS1LAC",
+    STALE_ISIN: "OMEGA CAPITAL SR D 9.2 NCD 31OT31 FVRS1LAC",
+    UNPRICED_ISIN: "OMEGA CAPITAL SR E 7.9 NCD 31OT31 FVRS1LAC",
+}
+
+
+def _db(tmp_path, *, master_coupon_for=(HAS_COUPON_ISIN,)) -> sqlite3.Connection:
+    path = tmp_path / "bonds.db"
+    conn = db.connect(path)
+    db.init_schema(conn)
+    for isin, name in NAMES.items():
+        coupon = 9.0 if isin in master_coupon_for else None
+        db.upsert_instrument(conn, isin, name=name, instrument_type="DEBT", exchange_listed=1,
+                             coupon_pct=coupon)
+        if name and isin in (DRAFT_ISIN, PERP_ISIN, HAS_COUPON_ISIN, PARTIAL_ISIN, PRICED_LOW_ISIN,
+                             PRICED_TIE_ISIN, PRICED_TIE_TOP_ISIN, STALE_ISIN, UNPRICED_ISIN):
+            db.upsert_descriptor_hint(conn, isin, parse_descriptor(name), None, OBSERVED)
+    prices = [
+        (PRICED_LOW_ISIN, TODAY - timedelta(days=1), 8.1, 3),
+        (PRICED_TIE_ISIN, TODAY - timedelta(days=2), 9.0, 1),
+        (PRICED_TIE_TOP_ISIN, TODAY - timedelta(days=3), 9.0, 5),
+        (STALE_ISIN, TODAY - timedelta(days=30), 9.2, 9),
+    ]
+    for isin, when, yld, trades in prices:
+        conn.execute(
+            "INSERT INTO price_snapshot (isin, trade_date, kind, price_per_100, reported_yield_pct, trades) "
+            "VALUES (?, ?, 'exchange_reported', ?, ?, ?)",
+            (isin, when.isoformat(), 99.5, yld, trades),
+        )
+    conn.commit()
+    return conn
+
+
+def _rows(path: Path) -> list[dict]:
+    with path.open(newline="", encoding="utf-8") as fh:
+        return list(csv.DictReader(fh))
+
+
+def _write(tmp_path, **kw):
+    conn = _db(tmp_path, **kw)
+    out = tmp_path / "drafts"
+    summary = write_drafts(conn, out, today=TODAY, max_age_days=7)
+    return conn, out, summary
+
+
+def test_master_draft_has_exact_header_only_eligible_isins_and_blanks(tmp_path):
+    conn, out, s = _write(tmp_path)
+    text = (out / DRAFT_MASTER_NAME).read_text(encoding="utf-8")
+    assert text.splitlines()[0] == ",".join(ci.MASTER_HEADER)
+    rows = _rows(out / DRAFT_MASTER_NAME)
+    isins = [r["isin"] for r in rows]
+    # Full hint without master coupon only. Partial, issuer-only and already-priced-in-master excluded.
+    assert isins == sorted(isins)  # deterministic order
+    assert sorted(isins) == sorted({DRAFT_ISIN, PERP_ISIN, PRICED_LOW_ISIN, PRICED_TIE_ISIN,
+                                    PRICED_TIE_TOP_ISIN, STALE_ISIN, UNPRICED_ISIN})
+    assert HAS_COUPON_ISIN not in isins and PARTIAL_ISIN not in isins and ISSUER_ISIN not in isins
+
+    row = next(r for r in rows if r["isin"] == DRAFT_ISIN)
+    assert row["issuer_name"] == "Rec Limited"
+    assert row["instrument_name"] == DRAFT_NAME
+    assert row["face_value"] == "100000"
+    assert row["coupon_pct"] == "8.3"
+    assert row["maturity_date"] == "2031-10-31"
+    assert row["currency"] == "INR"
+    assert row["source_url"] == "NSE descriptor (unverified draft)"
+    assert row["retrieved_on"] == "2026-11-01"
+    for col in ("coupon_frequency", "first_interest_date", "issue_date", "security_type",
+                "seniority", "collateral_text", "is_perpetual", "is_at1", "is_structured",
+                "default_flag", "trading_suspended"):
+        assert row[col] == "", col
+    conn.close()
+
+
+def test_draft_leaves_perpetual_blank_even_with_hint(tmp_path):
+    conn, out, _ = _write(tmp_path)
+    row = next(r for r in _rows(out / DRAFT_MASTER_NAME) if r["isin"] == PERP_ISIN)
+    assert row["is_perpetual"] == ""
+    review = next(r for r in _rows(out / MASTER_REVIEW_NAME) if r["isin"] == PERP_ISIN)
+    assert review["perpetual_hint"] == "1"
+    conn.close()
+
+
+def test_draft_import_is_accepted_and_still_rejected_by_screener(tmp_path):
+    conn, out, _ = _write(tmp_path)
+    report = ci.import_instrument_master(conn, out / DRAFT_MASTER_NAME)
+    assert report.errors == []
+    assert report.rows_ok == 7  # every draft row: DRAFT, PERP and the five OMEGA ISINs
+    counts = run_screen(conn, TODAY, run_id="draft-test")
+    assert counts["buckets"]["primary"] == 0 and counts["buckets"]["speculative"] == 0
+    for isin in (DRAFT_ISIN, PERP_ISIN):
+        bucket = conn.execute(
+            "SELECT bucket FROM screen_result WHERE run_id = 'draft-test' AND isin = ?", (isin,)
+        ).fetchone()[0]
+        assert bucket == "rejected"
+        reasons = {r[0] for r in conn.execute(
+            "SELECT rule FROM rejection WHERE run_id = 'draft-test' AND isin = ?", (isin,))}
+        assert {"no_instrument_rating", "unverified_default_flag"} <= reasons
+    conn.close()
+
+
+def test_writing_drafts_never_changes_instrument_table(tmp_path):
+    conn = _db(tmp_path)
+    before = conn.execute("SELECT * FROM instrument ORDER BY isin").fetchall()
+    write_drafts(conn, tmp_path / "drafts", today=TODAY, max_age_days=7)
+    after = conn.execute("SELECT * FROM instrument ORDER BY isin").fetchall()
+    assert [tuple(r) for r in before] == [tuple(r) for r in after]
+    conn.close()
+
+
+def test_review_rows_list_missing_fields_and_reference_links(tmp_path):
+    conn, out, _ = _write(tmp_path)
+    rows = _rows(out / MASTER_REVIEW_NAME)
+    assert {r["isin"] for r in rows} == set(NAMES) - {ISSUER_ISIN}
+    r = next(x for x in rows if x["isin"] == DRAFT_ISIN)
+    assert r["cdsl_reference_url"] == CDSL_URL.format(isin=DRAFT_ISIN)
+    assert r["bonddekho_reference_url"] == BONDDEKHO_URL.format(isin=DRAFT_ISIN)
+    assert r["cdsl_reference_url"] == f"https://www.cdslindia.com/CorporateBond/CorpBondDatabase.aspx?ISIN={DRAFT_ISIN}"
+    assert r["bonddekho_reference_url"] == f"https://www.bonddekho.com/bond/{DRAFT_ISIN}"
+    for part in ("coupon_frequency", "issue_date or first_interest_date", "instrument rating",
+                 "security_type", "seniority", "is_perpetual", "is_at1", "is_structured",
+                 "default_flag", "trading_suspended"):
+        assert part in r["still_missing"].split("; ")
+    assert r["years_to_maturity"] == f"{(date(2031, 10, 31) - TODAY).days / 365.25:.2f}"
+    conn.close()
+
+
+def test_worklist_orders_by_yield_then_trades_and_applies_window(tmp_path):
+    conn, out, s = _write(tmp_path)
+    work = _rows(out / WORKLIST_CSV_NAME)
+    assert [r["isin"] for r in work] == [PRICED_TIE_TOP_ISIN, PRICED_TIE_ISIN, PRICED_LOW_ISIN]
+    assert s.worklist_rows == 3
+    assert work[0]["issuer_series"] == "Omega Capital SR C"
+    assert work[0]["nse_reported_yield_pct_unverified"] == "9"
+    assert work[0]["trades"] == "5"
+    assert work[0]["price_date"] == (TODAY - timedelta(days=3)).isoformat()
+    conn.close()
+
+
+def test_worklist_markdown_has_header_text_and_table(tmp_path):
+    conn, out, _ = _write(tmp_path)
+    md = (out / WORKLIST_MD_NAME).read_text(encoding="utf-8")
+    assert WORKLIST_HEADER_TEXT in md
+    assert "| ISIN | Issuer / series | Coupon hint % |" in md
+    table_rows = [line for line in md.splitlines() if line.startswith("| INE")]
+    assert [line.split("|")[1].strip() for line in table_rows] == [
+        PRICED_TIE_TOP_ISIN, PRICED_TIE_ISIN, PRICED_LOW_ISIN]
+    conn.close()
+
+
+def test_readme_states_currency_basis_and_workflow(tmp_path):
+    conn, out, _ = _write(tmp_path)
+    text = (out / README_NAME).read_text(encoding="utf-8")
+    assert "currency" in text and "INR" in text and "FVRS" in text
+    assert "unverified" in text.lower()
+    assert "instrument_master.csv" in text
+    conn.close()
+
+
+def test_drafts_are_deterministic_on_rerun(tmp_path):
+    conn = _db(tmp_path)
+    out = tmp_path / "drafts"
+    write_drafts(conn, out, today=TODAY, max_age_days=7)
+    first = {n: (out / n).read_bytes() for n in (DRAFT_MASTER_NAME, MASTER_REVIEW_NAME,
+                                                  WORKLIST_CSV_NAME, WORKLIST_MD_NAME, README_NAME)}
+    write_drafts(conn, out, today=TODAY, max_age_days=7)
+    for name, body in first.items():
+        assert (out / name).read_bytes() == body, name
+    conn.close()
+
+
+def test_empty_db_writes_header_only_files(tmp_path):
+    path = tmp_path / "empty.db"
+    conn = db.connect(path)
+    db.init_schema(conn)
+    out = tmp_path / "drafts"
+    s = write_drafts(conn, out, today=TODAY, max_age_days=7)
+    assert (s.hinted, s.master_rows, s.review_rows, s.worklist_rows) == (0, 0, 0, 0)
+    assert (out / DRAFT_MASTER_NAME).read_text(encoding="utf-8").splitlines() == [",".join(ci.MASTER_HEADER)]
+    assert len(_rows(out / MASTER_REVIEW_NAME)) == 0
+    assert WORKLIST_HEADER_TEXT in (out / WORKLIST_MD_NAME).read_text(encoding="utf-8")
+    conn.close()
+
+
+def test_db_without_hint_table_is_treated_as_no_hints(tmp_path):
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE instrument (isin TEXT PRIMARY KEY, name TEXT)")
+    conn.commit()
+    s = write_drafts(conn, tmp_path / "drafts", today=TODAY, max_age_days=7)
+    assert s.hinted == 0
+    conn.close()
+
+
+def test_cli_draft_exit_codes_and_outputs(tmp_path):
+    missing = subprocess.run([sys.executable, str(SCRIPT), "draft", "--db", str(tmp_path / "none.db"),
+                              "--out", str(tmp_path / "d")], capture_output=True, text=True)
+    assert missing.returncode == 2
+    assert "database not found" in missing.stderr
+
+    conn = _db(tmp_path)
+    conn.close()
+    ok = subprocess.run([sys.executable, str(SCRIPT), "draft", "--db", str(tmp_path / "bonds.db"),
+                         "--out", str(tmp_path / "d"), "--max-age-days", "7"],
+                        capture_output=True, text=True)
+    assert ok.returncode == 0, ok.stderr
+    assert "instrument_master_DRAFT.csv rows:" in ok.stdout
+    assert (tmp_path / "d" / WORKLIST_MD_NAME).is_file()
+
+
+def test_worklist_excludes_hinted_matured_bonds():
+    from datetime import date
+    from india_bonds.enrichment.drafts import worklist
+    base = dict(issuer="X LTD", series="SR 1", coupon_hint=9.0, face_hint=1000.0, years_to_maturity=1.0,
+                latest_price_date="2026-10-30", nse_reported_yield_pct=10.0, trades=1,
+                price_per_100=98.0, still_missing=["coupon_frequency"],
+                cdsl_reference_url="x", bonddekho_reference_url="y")
+    rows = worklist([
+        dict(base, isin="INE000T00001", maturity_hint="2026-05-07"),   # matured -> excluded
+        dict(base, isin="INE000T00002", maturity_hint="2027-05-07"),   # kept
+        dict(base, isin="INE000T00003", maturity_hint=None),            # unknown maturity -> kept
+    ], date(2026, 11, 2), 7)
+    assert [r["isin"] for r in rows] == ["INE000T00002", "INE000T00003"]

@@ -36,6 +36,10 @@ URL_BHAV_TEMPLATE = "https://nsearchives.nseindia.com/content/cm/BhavCopy_NSE_CM
 
 ISIN_RE = re.compile(r"^IN[A-Z0-9]{10}$")
 GOV_ISIN_PREFIX = "IN00"
+# Corporate debt ISINs start "INE". Everything else in the active-debt list is not a corporate bond:
+# IN00/IN0x sovereign, IN1x-IN4x state development loans (e.g. "Karnataka State"), INS social-stock
+# instruments. corporate_only keeps INE only (verified on the live list: 1,764 INE vs 3,580 state-loan ISINs).
+CORPORATE_ISIN_PREFIX = "INE"
 CORPORATE_SERIES_RE = re.compile(r"^N[0-9A-Z]$")
 COUPON_HINT_RE = re.compile(r"(\d{1,2}(?:\.\d{1,4})?)\s*%")
 
@@ -92,7 +96,7 @@ class NseDebtUniverse(Connector):
             if not ISIN_RE.match(isin):
                 stats["invalid_isin"] += 1
                 continue
-            if self.corporate_only and isin.startswith(GOV_ISIN_PREFIX):
+            if self.corporate_only and not isin.startswith(CORPORATE_ISIN_PREFIX):
                 stats["gov_dropped"] += 1
                 continue
             stats["kept"] += 1

@@ -2,12 +2,13 @@
 
 Usage:
     .venv/bin/python scripts/refresh.py [--db data/bonds.db] [--date YYYY-MM-DD]
-        [--offline] [--no-corp-trades] [--inputs data/inputs] [--out reports] [--no-report]
-        [--init-inputs]
+        [--offline] [--no-corp-trades] [--no-hints] [--inputs data/inputs] [--out reports]
+        [--no-report] [--init-inputs]
 
 --date defaults to today in UTC+5:30. --offline skips all network connectors and only
-imports CSV inputs, screens, and reports. --no-corp-trades skips the NSE OTC/RFQ source. --init-inputs writes header-only CSV templates
-into the inputs folder (never overwrites) and exits without network access.
+imports CSV inputs, screens, and reports. --no-corp-trades skips the NSE OTC/RFQ source. --no-hints
+skips the descriptor hints step (UNVERIFIED hints parsed from NSE bond names; DB-only). --init-inputs
+writes header-only CSV templates into the inputs folder (never overwrites) and exits without network access.
 
 Exit codes: 0 normal (unavailable sources are warnings), 2 database cannot be opened or is
 an older DB that must be rebuilt (see SchemaRebuildRequired), 1 unexpected error (traceback printed).
@@ -57,6 +58,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--offline", action="store_true", help="skip all network connectors")
     parser.add_argument("--no-corp-trades", action="store_true",
                         help="skip the NSE OTC/RFQ corporate bond trades source")
+    parser.add_argument("--no-hints", action="store_true",
+                        help="skip the descriptor hints step (unverified hints from NSE bond names)")
     parser.add_argument("--inputs", default="data/inputs", help="folder with optional CSV inputs")
     parser.add_argument("--out", default="reports", help="report output root (default reports)")
     parser.add_argument("--no-report", action="store_true", help="do not write the report folder")
@@ -78,7 +81,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         summary = run_refresh(
             args.db, settlement, args.offline, args.inputs, args.out, make_report=not args.no_report,
-            corp_trades=not args.no_corp_trades,
+            corp_trades=not args.no_corp_trades, hints=not args.no_hints,
         )
     except DatabaseOpenError as exc:
         print(f"error: {exc}", file=sys.stderr)

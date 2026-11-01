@@ -51,6 +51,7 @@ from india_bonds.data_sources.nse import (
     index_from_url,
 )
 from india_bonds.database import db
+from india_bonds.enrichment.descriptor import parse_descriptor
 from india_bonds.reports.markdown import NoRunError, write_report
 from india_bonds.screening.eligibility import STALE_PRICE_DAYS
 from india_bonds.screening.screener import run_screen
@@ -121,6 +122,11 @@ class RefreshSummary:
     corp_skipped_unknown_isin: Optional[int] = None
     corp_seeded_new_instruments: Optional[int] = None
     corp_trade_date: Optional[str] = None
+    hints_new: Optional[int] = None
+    hints_changed: Optional[int] = None
+    hints_unchanged: Optional[int] = None
+    hints_unparseable: Optional[int] = None
+    hints_issuer_only: Optional[int] = None
     csv: list[CsvSummary] = field(default_factory=list)
     screen: dict = field(default_factory=dict)
     screen_reused: bool = False
@@ -452,6 +458,45 @@ def _load_corp_trades(conn, summary: RefreshSummary, connector, settlement: date
             )
 
 
+def _latest_ok_source_id(conn, source: str) -> Optional[int]:
+    row = conn.execute(
+        "SELECT id FROM source_record WHERE source = ? AND status = 'ok' ORDER BY id DESC LIMIT 1",
+        (source,),
+    ).fetchone()
+    return int(row["id"]) if row is not None else None
+
+
+def _load_hints(conn, summary: RefreshSummary) -> None:
+    """Parse NSE descriptor names of INE instruments into UNVERIFIED descriptor_hint rows.
+
+    DB-only (no network). A name that yields none of coupon/maturity/face is 'unparseable';
+    of those, a name with no instrument-kind token and no FVRS token is 'issuer-only'.
+    Hints are written only when new or changed; source_id = latest ok nse_corp_trades record.
+    """
+    source_id = _latest_ok_source_id(conn, NseCorpBondTrades.source)
+    observed_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    counts = {"new": 0, "changed": 0, "unchanged": 0, "unparseable": 0, "issuer_only": 0}
+    names = conn.execute(
+        "SELECT isin, name FROM instrument WHERE isin LIKE 'INE%' AND name IS NOT NULL ORDER BY isin"
+    ).fetchall()
+    for isin, name in names:
+        d = parse_descriptor(name)
+        if d.coupon_pct is None and d.maturity_date is None and d.face_value is None:
+            counts["unparseable"] += 1
+            if d.instrument_kind is None and "FVRS" not in name.upper():
+                counts["issuer_only"] += 1
+            continue
+        status = db.upsert_descriptor_hint(conn, isin, d, source_id, observed_at)
+        counts[status] += 1
+    conn.commit()
+    summary.hints_new = counts["new"]
+    summary.hints_changed = counts["changed"]
+    summary.hints_unchanged = counts["unchanged"]
+    summary.hints_unparseable = counts["unparseable"]
+    summary.hints_issuer_only = counts["issuer_only"]
+    summary.db_writes += counts["new"] + counts["changed"]
+
+
 def _record_bse(conn, summary: RefreshSummary, connector) -> None:
     rec = connector.fetch()
     summary.sources.append(SourceStatus(rec.source, rec.status, rec.note, rec.size_bytes))
@@ -529,7 +574,7 @@ def _stored_screen_summary(conn, run_id: str, settlement: date) -> dict:
 
 def _run(conn, summary: RefreshSummary, settlement: date, offline: bool, inputs_dir: Path,
          out_dir: Path, make_report: bool, connectors: Optional[Mapping[str, Any]],
-         corp_trades: bool = True) -> None:
+         corp_trades: bool = True, hints: bool = True) -> None:
     if offline:
         for name in (NseDebtUniverse.source, NseCmBhavcopy.source, NseCorpBondTrades.source, BseDebt.source):
             summary.sources.append(SourceStatus(name, "skipped", "--offline"))
@@ -542,6 +587,9 @@ def _run(conn, summary: RefreshSummary, settlement: date, offline: bool, inputs_
         else:
             summary.sources.append(SourceStatus(NseCorpBondTrades.source, "skipped", "--no-corp-trades"))
         _record_bse(conn, summary, conns["bse"])
+
+    if hints:
+        _load_hints(conn, summary)
 
     _import_csvs(conn, summary, inputs_dir)
 
@@ -575,11 +623,13 @@ def run_refresh(
     make_report: bool,
     connectors: Optional[Mapping[str, Any]] = None,
     corp_trades: bool = True,
+    hints: bool = True,
 ) -> RefreshSummary:
     """Run one refresh. Raises DatabaseOpenError if the DB cannot be created or opened.
 
     connectors may override any of the keys 'universe', 'bhavcopy', 'corp_trades', 'bse'
     (tests inject fakes). corp_trades=False skips the NSE OTC/RFQ source entirely.
+    hints=False skips the descriptor hints step (DB-only; runs in offline mode too).
     """
     db_path = Path(db_path)
     summary = RefreshSummary(db_path=str(db_path), settlement=settlement.isoformat(), offline=offline)
@@ -596,7 +646,7 @@ def run_refresh(
 
     try:
         _run(conn, summary, settlement, offline, Path(inputs_dir), Path(out_dir), make_report, connectors,
-             corp_trades=corp_trades)
+             corp_trades=corp_trades, hints=hints)
     finally:
         conn.close()
     return summary
@@ -667,6 +717,13 @@ def format_summary(s: RefreshSummary) -> str:
                 f"seeded_new_instruments={s.corp_seeded_new_instruments}"
                 f"{date_note} (prices as reported by NSE; clean-price basis and trade-value unit unverified)"
             )
+
+    if s.hints_new is not None:
+        lines.append(
+            f"descriptor hints: new={s.hints_new} changed={s.hints_changed} "
+            f"unchanged={s.hints_unchanged} unparseable={s.hints_unparseable} "
+            f"(issuer-only names: {s.hints_issuer_only})"
+        )
 
     lines.append("")
     lines.append("csv imports:")

@@ -368,3 +368,17 @@ def test_connector_base_fetch_requires_url(tmp_path):
     session = FakeSession(lambda url: FakeResp(200, UNIVERSE_CSV))
     with pytest.raises(NotImplementedError):
         Connector(session=session, raw_root=tmp_path).fetch()
+
+
+def test_universe_corporate_only_keeps_ine_and_drops_state_loans_and_social():
+    rows = [
+        {"Sr.No.": "1", "Company Name": "Some Corp Ltd", "ISIN": "INE000T00001", "Instrument Type": "DEBT"},
+        {"Sr.No.": "2", "Company Name": "Karnataka State", "ISIN": "IN1920230013", "Instrument Type": "DEBT"},
+        {"Sr.No.": "3", "Company Name": "Tamilnadu State", "ISIN": "IN3120240012", "Instrument Type": "DEBT"},
+        {"Sr.No.": "4", "Company Name": "Social Org", "ISIN": "INS000000001", "Instrument Type": "DEBT"},
+        {"Sr.No.": "5", "Company Name": "Gold Bond", "ISIN": "IN0020170059", "Instrument Type": "DEBT"},
+    ]
+    conn = NseDebtUniverse()
+    assert [r["isin"] for r in conn.parse(rows)] == ["INE000T00001"]
+    assert conn.stats["gov_dropped"] == 4
+    assert [r["isin"] for r in NseDebtUniverse(corporate_only=False).parse(rows)] == [r["ISIN"] for r in rows]

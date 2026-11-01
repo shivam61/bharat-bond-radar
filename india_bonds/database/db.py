@@ -213,6 +213,56 @@ def insert_price_snapshot(
     return int(cur.lastrowid)
 
 
+_HINT_FIELDS = (
+    "raw", "issuer", "series", "kind", "coupon_pct", "maturity_date", "face_value",
+    "perpetual_hint", "at1_hint", "call_hint", "warnings",
+)
+
+
+def _hint_values(descriptor) -> tuple:
+    """Parsed fields of a descriptor in _HINT_FIELDS order (ints for flags, text for dates)."""
+    return (
+        descriptor.raw,
+        descriptor.issuer,
+        descriptor.series,
+        descriptor.instrument_kind,
+        descriptor.coupon_pct,
+        descriptor.maturity_date.isoformat() if descriptor.maturity_date else None,
+        descriptor.face_value,
+        int(descriptor.perpetual_hint),
+        int(descriptor.at1_hint),
+        int(descriptor.call_hint),
+        "; ".join(descriptor.warnings) or None,
+    )
+
+
+def upsert_descriptor_hint(conn: sqlite3.Connection, isin: str, descriptor, source_id, observed_at) -> str:
+    """Store UNVERIFIED descriptor hints for isin. Returns 'new', 'changed' or 'unchanged'.
+
+    Change-aware: every parsed field is compared with the stored row; an unchanged hint is not
+    written (observed_at keeps the time the current value was first seen). Callers own commit.
+    """
+    values = _hint_values(descriptor)
+    row = conn.execute(
+        f"SELECT {', '.join(_HINT_FIELDS)} FROM descriptor_hint WHERE isin = ?", (isin,)
+    ).fetchone()
+    if row is None:
+        status = "new"
+    elif tuple(row) == values:
+        return "unchanged"
+    else:
+        status = "changed"
+    conn.execute(
+        "INSERT INTO descriptor_hint (isin, " + ", ".join(_HINT_FIELDS) + ", source_id, observed_at) "
+        "VALUES (?, " + ", ".join("?" for _ in _HINT_FIELDS) + ", ?, ?) "
+        "ON CONFLICT(isin) DO UPDATE SET "
+        + ", ".join(f"{f} = excluded.{f}" for f in _HINT_FIELDS)
+        + ", source_id = excluded.source_id, observed_at = excluded.observed_at",
+        (isin, *values, source_id, observed_at),
+    )
+    return status
+
+
 def availability_exists(
     conn, *, isin, platform, observed_at, offered_for_sale, min_investment
 ) -> bool:
